@@ -22,8 +22,6 @@ WHAT'S NEW vs v1:
   ─ Max-drawdown and CVaR computed per final portfolio for display
   ─ Sector concentration constraint auto-added (max 40% in one sector) if not overridden
 """
-import os
-import json
 import logging
 import numpy as np
 import pandas as pd
@@ -202,9 +200,7 @@ def compute_momentum(prices: np.ndarray, windows: List[int], mode: str = "short"
     used_weights = []
     for w, window in zip(weights_w, windows):
         if len(prices) > window:
-            # Log-return: additive and better-conditioned for high-vol penny stocks
-            p0 = max(float(prices[-window]), 1e-8)
-            ret = float(np.log(prices[-1] / p0))
+            ret = prices[-1] / prices[-window] - 1.0
             scores.append(w * ret)
             used_weights.append(w)
 
@@ -212,9 +208,8 @@ def compute_momentum(prices: np.ndarray, windows: List[int], mode: str = "short"
         return 0.0
 
     raw = np.sum(scores) / np.sum(used_weights)
-    # Tighter scale for intraday/short gives more sensitivity on fast movers
-    scale = 5.0 if mode in ("intraday", "short") else 3.0
-    return float(np.tanh(raw * scale))
+    # Scale factor of 3 gives meaningful spread without hard-squashing moderate signals
+    return float(np.tanh(raw * 3))
 
 
 def compute_max_drawdown(returns: np.ndarray) -> float:
@@ -746,8 +741,8 @@ def compute_portfolio_risk_metrics(
 
         # Sortino: semi-deviation of horizon returns
         neg_rets = horizon_sim[horizon_sim < rf_horizon]
-        semi_var = np.mean((neg_rets - rf_horizon) ** 2) if len(neg_rets) > 10 else ann_port_var
-        ds = float(np.sqrt(semi_var)) if semi_var > 1e-12 else max(ann_port_vol, 1e-6)
+        semi_var = np.mean((neg_rets - rf_horizon) ** 2) if len(neg_rets) > 10 else port_var
+        ds = float(np.sqrt(semi_var)) if semi_var > 1e-12 else max(port_vol, 1e-6)
         sortino = (port_ret - rf_horizon) / ds if ds > 1e-8 else 0.0
 
         # Max drawdown: path-dependent from simulated daily paths
@@ -760,14 +755,14 @@ def compute_portfolio_risk_metrics(
 
     except Exception as exc:
         logger.warning(f"Monte Carlo failed: {exc} — using analytical fallback.")
-        cvar        = ann_port_vol
+        cvar        = port_vol
         prob_profit = 0.5
-        max_dd      = -ann_port_vol
+        max_dd      = -port_vol
         sortino     = sharpe
 
     return {
         "expected_return_pct":    round(port_ret * 100, 2),
-        "expected_volatility_pct": round(ann_port_vol * 100, 2),
+        "expected_volatility_pct": round(port_vol * 100, 2),
         "sharpe_ratio":            round(sharpe, 3),
         "sortino_ratio":           round(sortino, 3),
         "cvar_95_pct":             round(cvar * 100, 2),
@@ -785,7 +780,7 @@ def predict_short_term_prices(
     tickers: List[str],
     horizon_days: int,
     cfg: Dict[str, Any],
-    n_sim: int = 5000,
+    n_sim: int = 2000,
 ) -> Dict[str, Any]:
     """
     Short-term price prediction via momentum-adjusted GBM simulation.
@@ -824,13 +819,8 @@ def predict_short_term_prices(
             ewma_var[k] = lam * ewma_var[k - 1] + (1 - lam) * log_rets[k] ** 2
         daily_vol = float(np.sqrt(ewma_var[-1]))
 
-        # EWMA-weighted drift: recent bars carry more weight (λ=0.94)
-        # Equal-weight mean drags in stale data — kills short-term accuracy
-        ewma_drift = np.zeros(len(log_rets))
-        ewma_drift[0] = log_rets[0]
-        for k in range(1, len(log_rets)):
-            ewma_drift[k] = lam * ewma_drift[k - 1] + (1 - lam) * log_rets[k]
-        daily_drift = float(ewma_drift[-1])
+        # Drift from annualised mean (log return)
+        daily_drift = float(np.mean(log_rets))
 
         # Momentum bonus: extra directional tilt for short-term
         momentum_window = 5 if mode in ("intraday", "short") else 15
@@ -843,22 +833,15 @@ def predict_short_term_prices(
         # RSI signal: bullish <40, bearish >65 (asymmetric — downside faster)
         rsi_signal = -0.1 if rsi_val > 65 else (0.05 if rsi_val < 40 else 0.0)
 
-        # Blend: 60% EWMA drift, 40% momentum + RSI nudge
+        # Blend: 60% historical drift, 40% momentum + RSI nudge
         blended_drift = 0.60 * daily_drift + 0.40 * (mom_ret + rsi_signal * daily_vol)
-
-        # Trading steps: convert calendar days → actual bar count
-        # intraday 5m bars: ann=252*78 → 78 bars/day; daily: ann=252 → 1 bar/day
-        bars_per_day = max(1, int(ann / 252))
-        trading_steps = horizon_days * bars_per_day
-        # More simulations for short-horizon (fat tails matter most there)
-        effective_nsim = n_sim * 2 if mode in ("intraday", "short") else n_sim
 
         # Simulate GBM paths
         rng = np.random.default_rng(42)
-        z = rng.standard_normal((trading_steps, effective_nsim))
+        z = rng.standard_normal((horizon_days, n_sim))
         # log-price increments: drift - 0.5σ² + σZ (Itô correction)
         increments = (blended_drift - 0.5 * daily_vol ** 2) + daily_vol * z
-        log_price_paths = np.cumsum(increments, axis=0)  # (trading_steps, effective_nsim)
+        log_price_paths = np.cumsum(increments, axis=0)  # (horizon_days, n_sim)
         final_prices = last_price * np.exp(log_price_paths[-1])
 
         median_target = float(np.median(final_prices))
