@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: q-filing-api
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: FRONTEND_ORIGIN
+        value: "*"
+      - key: USE_EXISTING_PIPELINE
+        value: "false"
+      - key: USE_QUANTUM_CORE
+        value: "false"
