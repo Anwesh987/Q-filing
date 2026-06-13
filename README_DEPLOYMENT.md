@@ -105,7 +105,3 @@ Output directory: dist
 Environment variable:
 VITE_API_BASE_URL=https://your-render-backend-url.onrender.com
 ```
-
-## What to put on resume
-
-Built the frontend and cloud deployment layer for Q-Filing, an AI + quantum-inspired portfolio compliance optimizer. Developed a React dashboard for compliance text input, extracted constraints, portfolio allocation, and risk metrics. Wrapped the backend with FastAPI, added CORS, health checks, Docker support, and deployment configuration for cloud hosting.
